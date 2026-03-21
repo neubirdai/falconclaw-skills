@@ -1,0 +1,102 @@
+name: Validate Skills
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['skills/**']
+  push:
+    branches: [main]
+    paths: ['skills/**']
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install yaml parser
+        run: npm install yaml
+
+      - name: Validate skills
+        run: |
+          node --input-type=module <<'SCRIPT'
+          import { readdirSync, readFileSync } from 'fs';
+          import { join } from 'path';
+          import { parse as parseYaml } from 'yaml';
+
+          const SKILLS_DIR = 'skills';
+          const NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+          const MAX_LINES = 500;
+          let errors = 0;
+
+          function fail(skill, msg) {
+            console.error(`❌ ${skill}: ${msg}`);
+            errors++;
+          }
+
+          const dirs = readdirSync(SKILLS_DIR, { withFileTypes: true })
+            .filter(d => d.isDirectory())
+            .map(d => d.name);
+
+          for (const dir of dirs) {
+            if (!NAME_RE.test(dir)) {
+              fail(dir, `directory name must be lowercase alphanumeric + hyphens, max 64 chars`);
+            }
+
+            const skillPath = join(SKILLS_DIR, dir, 'SKILL.md');
+            let content;
+            try {
+              content = readFileSync(skillPath, 'utf-8');
+            } catch {
+              fail(dir, 'missing SKILL.md');
+              continue;
+            }
+
+            const lines = content.split('\n').length;
+            if (lines > MAX_LINES) {
+              fail(dir, `SKILL.md is ${lines} lines (max ${MAX_LINES})`);
+            }
+
+            const match = content.match(/^---\n([\s\S]*?)\n---/);
+            if (!match) {
+              fail(dir, 'missing YAML frontmatter (---) block');
+              continue;
+            }
+
+            let fm;
+            try {
+              fm = parseYaml(match[1]);
+            } catch (e) {
+              fail(dir, `invalid YAML frontmatter: ${e.message}`);
+              continue;
+            }
+
+            if (!fm.name) fail(dir, 'missing required field: name');
+            if (!fm.description) fail(dir, 'missing required field: description');
+            if (fm.name && fm.name !== dir) {
+              fail(dir, `name "${fm.name}" does not match directory "${dir}"`);
+            }
+          }
+
+          if (errors > 0) {
+            console.error(`\n${errors} error(s) found`);
+            process.exit(1);
+          }
+          console.log(`✅ ${dirs.length} skills validated`);
+          SCRIPT
+
+  dispatch:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger aviary rebuild
+        run: |
+          gh api repos/neubirdai/aviary/dispatches \
+            -f event_type=skills-updated
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
