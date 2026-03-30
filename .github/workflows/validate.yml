@@ -94,9 +94,9 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger aviary rebuild
+      - name: Trigger FalconClaw rebuild
         run: |
-          gh api repos/neubirdai/aviary/dispatches \
+          gh api repos/neubirdai/falconclaw/dispatches \
             -f event_type=skills-updated
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
