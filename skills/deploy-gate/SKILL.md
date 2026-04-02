@@ -3,9 +3,7 @@ name: deploy-gate
 description: "Pre-deploy safety check — assess whether it is safe to deploy one or more services right now."
 tags: [deploy, safety, release]
 homepage: https://neubird.ai/skills/deploy-gate
-metadata:
-  neubird:
-    emoji: "🚦"
+metadata: {"neubird":{"emoji":"🚦","requires":{"bins":["neubird"]}}}
 ---
 
 # Deploy Gate
