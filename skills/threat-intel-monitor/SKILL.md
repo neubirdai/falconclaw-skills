@@ -1,67 +1,83 @@
 ---
 name: threat-intel-monitor
-description: "Monitor public threat intelligence feeds for malicious IPs, domains, and IOCs using web search. Use when: (1) periodic threat feed checks needed, (2) investigating suspicious network activity, (3) proactive security posture monitoring."
+description: "Cross-reference IPs from customer telemetry against public threat intelligence using web search. Use when: (1) checking if IPs in your environment are malicious, (2) investigating suspicious network activity, (3) proactive security posture monitoring."
 tags: [security, proactive, threat-intel]
 homepage: https://neubird.ai/skills/threat-intel-monitor
-metadata: {"neubird":{"emoji":"🛡️","requires":{"features":["web_search"]}}}
+metadata: {"neubird":{"emoji":"🛡️","requires":{"features":["web_search","tool_exec"]}}}
 ---
 
 # Threat Intelligence Monitor
 
-Continuously monitor public threat intelligence sources for malicious IPs, domains, and indicators of compromise (IOCs) using web search.
+Extract IPs from your telemetry sources, then use `web_search` to check them against public threat intelligence databases.
 
 ## When to Use
 
-- Periodic checks of threat feeds for new malicious IPs targeting your industry/region
-- Investigating whether specific IPs or domains appear in known blocklists
-- Proactive security posture monitoring during oncall shifts
+- Checking whether IPs seen in your environment appear in known threat feeds
+- Investigating suspicious source/destination IPs from firewall or VPC flow logs
+- Periodic security sweeps of your telemetry for indicators of compromise
 - Enriching incident investigations with external threat context
 
 ## How It Works
 
-Use `web_search` to query public threat intelligence sources. Do NOT attempt SQL queries or database lookups for this — all data comes from the open web.
+1. **Query telemetry** — Use `tool_exec` to run SQL against FDW tables (firewall logs, VPC flow logs, access logs, etc.) to extract unique IPs
+2. **Check each IP** — Use `web_search` to look up extracted IPs against public threat intel sources
+3. **Report findings** — Flag any IPs that appear in blocklists or have abuse reports
 
-## Sources to Query
+## Step 1: Extract IPs from Telemetry
 
-Search these public threat intelligence sources in priority order:
+Query FDW tables that contain network traffic data. Look for tables with columns like `source_ip`, `destination_ip`, `client_ip`, `remote_addr`, or similar.
 
-1. **AbuseIPDB** — recently reported malicious IPs, check abuse confidence scores
-   - Search: `site:abuseipdb.com reported IPs today` or specific IP lookups
-2. **Threat Fox (abuse.ch)** — IOCs including IPs, domains, URLs linked to malware
-   - Search: `site:threatfox.abuse.ch recent IOCs`
-3. **SANS Internet Storm Center** — current threat activity, top attacking IPs
-   - Search: `site:isc.sans.edu infocon threat activity today`
-4. **GreyNoise** — internet-wide scan and attack activity
-   - Search: `site:viz.greynoise.io malicious IP activity`
-5. **AlienVault OTX** — open threat exchange, community-sourced IOCs
-   - Search: `site:otx.alienvault.com recent pulses malicious IP`
-6. **Shodan** — exposed services and known vulnerable hosts
-   - Search: `site:shodan.io vulnerability recent`
-7. **URLhaus (abuse.ch)** — malicious URLs distributing malware
-   - Search: `site:urlhaus.abuse.ch recent malware URLs`
-8. **Feodo Tracker (abuse.ch)** — botnet C2 server tracking
-   - Search: `site:feodotracker.abuse.ch botnet C2`
+Example queries:
+```sql
+-- Unique external source IPs from firewall logs (last 6h)
+SELECT DISTINCT source_ip FROM "firewall_logs"."entries"
+WHERE timestamp > NOW() - INTERVAL '6 hours'
+LIMIT 50
 
-When the user asks about a **specific IP or domain**, search for it directly:
-- `"<IP>" malicious threat report`
-- `site:abuseipdb.com "<IP>"`
-- `site:virustotal.com "<IP or domain>"`
+-- Unique destination IPs from VPC flow logs
+SELECT DISTINCT destination_ip FROM "vpc_flow"."logs"
+WHERE timestamp > NOW() - INTERVAL '6 hours'
+AND action = 'ACCEPT'
+LIMIT 50
+```
 
-## Output Format
+Collect the unique IPs, then move to Step 2.
+
+## Step 2: Check IPs via Web Search
+
+For each IP (or batch of IPs), search these sources in priority order:
+
+1. **AbuseIPDB** — abuse confidence scores and report history
+   - Search: `site:abuseipdb.com "<IP>"`
+2. **VirusTotal** — aggregated detection results
+   - Search: `site:virustotal.com "<IP>"`
+3. **GreyNoise** — is this IP a known scanner/attacker?
+   - Search: `site:viz.greynoise.io "<IP>"`
+4. **Threat Fox (abuse.ch)** — IOC linked to malware campaigns
+   - Search: `site:threatfox.abuse.ch "<IP>"`
+5. **Shodan** — exposed services and vulnerabilities
+   - Search: `site:shodan.io "<IP>"`
+
+To check multiple IPs efficiently, batch them:
+- `"<IP1>" OR "<IP2>" OR "<IP3>" malicious threat report`
+
+## Step 3: Report Findings
 
 Present findings as a structured table:
 
-| IP/Domain | Source | Threat Type | Confidence | Last Seen | Details |
-|-----------|--------|-------------|------------|-----------|---------|
+| IP | Source | Found In | Threat Type | Confidence | Details |
+|----|--------|----------|-------------|------------|---------|
+| 1.2.3.4 | firewall_logs | AbuseIPDB | Brute Force | 95% | 47 reports in last 30 days |
 
-Above the table, include a one-line threat summary: how many new IOCs found, highest severity, any trending attack patterns.
+Above the table, include a one-line summary: how many telemetry IPs were checked, how many flagged, highest severity.
 
 ## Rules
 
+- Query telemetry FIRST to get real IPs from the customer's environment — do not just pull generic blocklists
 - Use at most 3-4 web searches per check to stay within rate limits
-- Focus on **new** or **recently reported** threats (last 24-48 hours)
+- Batch IPs in web searches where possible
 - Always include the source URL so findings can be verified
-- If an IP or domain appears in multiple sources, note the corroboration — higher confidence
+- If an IP appears in multiple threat sources, note the corroboration — higher confidence
 - Do NOT fabricate IOC data — only report what web search actually returns
-- If no new threats are found, say "No new threats detected" — false positives destroy trust
-- When used with `/watch`, the plan should be the specific web search queries to repeat
+- If no IPs are flagged, say "No threats detected in your telemetry" — false positives destroy trust
+- When used with `/watch`, the plan should be: re-query telemetry for new IPs, then web search those
