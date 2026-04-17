@@ -1,6 +1,6 @@
 ---
 name: threat-intel-monitor
-description: "Show threat intelligence findings — malicious IPs detected in your telemetry. Merlin's sentinel automatically extracts IPs from telemetry and checks them via web search against threat databases. Use when: (1) user asks about malicious IPs or threat intel, (2) user wants a threat report, (3) periodic security posture review."
+description: "Check if your services are being attacked using threat intelligence websites. Merlin automatically runs this in the background and saves findings. Use when: user asks about malicious IPs, threats, or security posture."
 tags: [security, proactive, threat-intel]
 homepage: https://neubird.ai/skills/threat-intel-monitor
 metadata: {"neubird":{"emoji":"🛡️","requires":{"features":["tool_exec","web_search"]}}}
@@ -8,22 +8,49 @@ metadata: {"neubird":{"emoji":"🛡️","requires":{"features":["tool_exec","web
 
 # Threat Intelligence Monitor
 
-Surface threat intelligence findings from Merlin's automated background scans, and optionally investigate specific IPs deeper via web search.
+Check if your services are being attacked by looking up IPs and network indicators against threat intelligence websites.
+
+## Threat Intelligence Websites
+
+Use these sites to check IPs and indicators:
+
+**IP Reputation & Abuse**
+- https://www.abuseipdb.com/ — crowdsourced IP abuse reports, confidence scores
+- https://www.virustotal.com/ — multi-engine malware/IP scanning
+- https://www.shodan.io/ — exposed ports, services, vulnerabilities
+
+**Blocklists & Known Bad IPs**
+- https://isc.sans.edu/ — SANS Internet Storm Center threat feeds
+- https://feodotracker.abuse.ch/ — Emotet/TrickBot/Dridex C2 servers
+- https://www.spamhaus.org/ — spam and botnet blocklists
+- https://lists.blocklist.de/ — fail2ban aggregated attack reports
+
+**Threat Intelligence Platforms**
+- https://otx.alienvault.com/ — AlienVault Open Threat Exchange
+- https://threatfox.abuse.ch/ — malware IOC sharing
+- https://urlhaus.abuse.ch/ — malicious URL tracking
+- https://bazaar.abuse.ch/ — malware sample exchange
+
+**Network Intelligence**
+- https://bgpview.io/ — ASN/IP ownership
+- https://ipinfo.io/ — geolocation, hosting provider
+- https://www.whois.com/ — domain/IP registration
+
+**Government / CERT**
+- https://www.cisa.gov/known-exploited-vulnerabilities-catalog — CISA KEV
+- https://www.circl.lu/ — Luxembourg CERT, passive DNS/SSL
 
 ## How It Works
 
-Merlin's sentinel runs in the background at a configured interval. Each run:
-1. Extracts distinct external IPs from customer telemetry (FDW log tables)
-2. Checks those IPs via Anthropic's web_search against threat intelligence databases (AbuseIPDB, VirusTotal, Shodan, Spamhaus, etc.)
-3. Persists any flagged IPs as `minority_report` incidents with `lens=threat-intel`
-
-This skill retrieves those findings. It can also do deeper investigation on specific IPs.
+Merlin's sentinel runs this automatically in the background. Each sweep:
+1. Collects your telemetry data (logs, CloudTrail, VPC flows, etc.)
+2. Sends it to Claude with web_search: "Using these threat intel sites, check if my services are being attacked"
+3. Claude finds IPs in the data, searches them, and reports back
+4. Any threats get saved as `minority_report` incidents with `lens=threat-intel`
 
 ## Steps
 
 ### View existing findings
-
-Query the incidents table for recent threat intel findings:
 
 ```sql
 SELECT id, title, summary, risk, created_at, enriched_raw_data
@@ -34,34 +61,20 @@ ORDER BY created_at DESC
 LIMIT 25
 ```
 
-Parse `enriched_raw_data` (JSON string) to extract: `ip`, `feed`, `threat_type`, `confidence`, `telemetry_source`, `port`, `first_seen`.
+### Investigate a specific IP (if user asks)
 
-### Investigate a specific IP (optional, if user asks)
+Use `web_search`:
 
-If the user asks about a specific IP or wants deeper analysis, use `web_search`:
-
-- Search: `"<IP>" AbuseIPDB threat intelligence`
-- Search: `"<IP>" VirusTotal malicious`
-- Search: `"<IP>" Shodan open ports`
-
-Present findings with source links.
+- `"<IP>" site:abuseipdb.com`
+- `"<IP>" site:virustotal.com`
+- `"<IP>" site:shodan.io`
+- `"<IP>" site:otx.alienvault.com`
 
 ## Output Format
 
-One-line summary first, then the table:
-
-**🛡 Threat Intel Report: X finding(s) — Y malicious IPs detected in your telemetry**
+**🛡 Threat Intel Report: X finding(s)**
 
 | IP | Threat Type | Source | Seen In | Confidence | When |
 |----|-------------|--------|---------|------------|------|
 
-- **Seen In** = the telemetry table where the IP was found (e.g. `log_vpc_flow.entries`)
-- **Source** = which threat intel database flagged it (e.g. `AbuseIPDB`)
-- If no findings exist, say: "No malicious IPs detected in your telemetry. Your network is clean."
-
-## Rules
-
-- Always check the database FIRST for existing Merlin findings
-- Only use web_search for deeper investigation on specific IPs the user asks about
-- When used with `/watch`, re-query the DB each interval to pick up new findings
-- If the user asks about a specific IP, filter: `AND enriched_raw_data LIKE '%"ip":"<IP>"%'`
+If no findings: "No malicious IPs detected. Your services look clean."
