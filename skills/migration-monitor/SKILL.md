@@ -8,7 +8,7 @@ metadata: {"neubird":{"emoji":"🔎","requires":{"anyBins":["aws","govc"]}}}
 
 # Migration Monitor (VMware → AWS)
 
-Captures live state on both sides of a VMware → AWS migration, diffs infrastructure, endpoint behavior, metrics, and database data, and emits a divergence report. One-shot analysis — re-invoke as needed.
+Captures live state on both sides of a VMware → AWS migration, diffs infrastructure, endpoint behavior, metrics, and database data, and emits a divergence report. One-shot analysis for **post-cutover verification** — re-invoke as needed.
 
 **Falcon handles all discovery natively.** This skill is pure knowledge: the workflow, signal weights, tolerance rules, metric equivalence tables, SQL queries, and report format. Every probe, command, and analysis step below is either Falcon's built-in capability or a concrete CLI invocation specified in the reference files. This skill ships no scripts or binaries.
 
@@ -108,10 +108,16 @@ Load `references/divergence-report.md`. Consolidate outputs of Phases 3–6 into
 - **Copy-ready remediation commands** use the fenced-bundle format with file-path header as the first line inside the block where the output is a file:
 
   ````
-  ```yaml
-  # file: manifests/networkpolicy-web.yaml
-  apiVersion: networking.k8s.io/v1
-  ...
+  ```hcl
+  # file: terraform/security-groups.tf
+  resource "aws_security_group_rule" "web_ingress_443" {
+    type              = "ingress"
+    from_port         = 443
+    to_port           = 443
+    protocol          = "tcp"
+    cidr_blocks       = ["10.0.0.0/8"]
+    security_group_id = aws_security_group.web.id
+  }
   ```
   ````
 
@@ -139,6 +145,7 @@ Load `references/divergence-report.md`. Consolidate outputs of Phases 3–6 into
 - **Auto-discover metric sources and available metrics from env.** Never ask the user to name metrics or provide metric queries.
 - **Emit precise CLI commands for every probe, discovery, and comparison step.** No narrative handwaving. The references specify exact invocations; follow them.
 - **Web-search current AWS CloudWatch metric namespaces** before finalizing any metric mapping — namespaces and metric names evolve.
+- **Confirm the metric comparison window with the user before Phase 5 runs.** Default is 7 days pre-cutover vs 7 days post-cutover; user may override.
 - Classify every divergence by severity using the tolerance rules in the relevant parity reference.
 - Skip unavailable phases explicitly — the divergence report must include a `skippedPhases` list with reasons. Never silently skip.
 
@@ -148,6 +155,7 @@ Load `references/divergence-report.md`. Consolidate outputs of Phases 3–6 into
 - Ship or suggest running probe scripts, helper binaries, or executable code. Falcon natively runs `aws`, `govc`, `curl`, `mysql`, etc.
 - Generate synthetic traffic.
 - Rely on migration-tracking tags as the sole mapping signal.
+- Filter discovery by tags during Phase 2 baseline capture. Discovery must be comprehensive regardless of tag state.
 - Prompt the user to enumerate metrics, metric queries, or metric names.
 - Guess metric-name equivalence without consulting `metrics-parity.md`. If a metric has no mapping, emit as "unmapped."
 - Run SQL that isn't `SELECT` (including `SELECT INTO`, DDL, DML).
