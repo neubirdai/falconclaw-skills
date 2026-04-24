@@ -349,12 +349,16 @@ Extract these fields from the JSON response:
 | `VirtualMachines[0].Config.GuestId` | `guestOs` |
 | `VirtualMachines[0].Config.Hardware.NumCPU` | `vcpus` |
 | `VirtualMachines[0].Config.Hardware.MemoryMB` | `memoryMB` |
-| `VirtualMachines[0].Config.Hardware.Device[]` filtered for `VirtualDisk` type | `disks` (sizeGB, datastore, thin) |
+| `VirtualMachines[0].Config.Hardware.Device[]` filtered for `VirtualDisk` type | `disks` (sizeGB, datastore, thin, encrypted) |
 | `VirtualMachines[0].Config.Hardware.Device[]` filtered for NIC types (MAC + backing) | `networks` (mac, portGroup) |
 | `VirtualMachines[0].Config.Annotation` | `annotation` |
 | `VirtualMachines[0].Guest.HostName` | `hostname` |
 | `VirtualMachines[0].Guest.Net[].IpAddress` flattened | `ipAddresses` |
 | `VirtualMachines[0].Runtime.PowerState` | `powerState` |
+
+Additional per-disk field extraction:
+
+- `encrypted` (disks[].encrypted): `Config.Hardware.Device[i].Backing.KeyId != null` for each VirtualDisk. Boolean per-disk.
 
 **Tags per VM (separate call using MoRef):**
 
@@ -608,7 +612,7 @@ After executing all discovery commands, Falcon assembles results into this in-me
         "hostname": "web-01.corp.example",
         "vcpus": 4,
         "memoryMB": 8192,
-        "disks": [{"sizeGB": 80, "datastore": "ds-01", "thin": true}],
+        "disks": [{"sizeGB": 80, "datastore": "ds-01", "thin": true, "encrypted": false}],
         "networks": [{"mac": "00:50:56:aa:bb:cc", "portGroup": "web-net"}],
         "ipAddresses": ["10.0.1.10"],
         "publicIp": null,

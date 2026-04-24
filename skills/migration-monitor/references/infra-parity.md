@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This reference drives Phase 3 infrastructure parity checks. It is consumed after Gate 2 mapping is locked — only paired workloads are evaluated. Each rule below defines a formula, a severity classification, and the structured divergence shape Falcon emits when the rule is violated. Divergences feed Phase 7's consolidated report. Phases 3 does not block the workflow; it records divergences for human review.
+This reference drives Phase 3 infrastructure parity checks. It is consumed after Gate 2 mapping is locked — only paired workloads are evaluated. Each rule below defines a formula, a severity classification, and the structured divergence shape Falcon emits when the rule is violated. Divergences feed Phase 7's consolidated report. Phase 3 does not block the workflow; it records divergences for human review.
 
 ---
 
@@ -85,6 +85,8 @@ Formula: `deficit = 1 - (sum(target EBS volume sizeGB) / source_total_diskGB)`. 
 
 `source_total_diskGB` = sum of `source.disks[].sizeGB`. OS disk exclusion is allowed: if the user designates an OS disk, exclude it from both sides before computing the ratio. Target EBS volumes enumerated via `aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=<instanceId>`.
 
+Edge cases: if `source_total_diskGB == 0` (diskless boot-from-SAN or similar), skip this check and emit no divergence. The encryption parity rule also skips — a VM with no disks can have no encryption mismatch.
+
 - Deficit > 10% → major
 - Deficit > 30% → critical
 
@@ -127,11 +129,13 @@ Example divergence (source p95 5000 IOPS, target gp3 3000 baseline):
 
 ### a. Security group rule parity
 
-Rules are compared as sets of `(cidr, protocol, port)` tuples. Source firewall rules come from VMware portgroup / NSX rules attached to `source.networks[].portGroup`, provided as pre-processed input. If unavailable, skip and log.
+Rules are compared as sets of `(cidr, protocol, fromPort, toPort)` tuples. Source firewall rules come from VMware portgroup / NSX rules attached to `source.networks[].portGroup`, provided as pre-processed input. If unavailable, skip and log.
 
 #### Inbound
 
-Target SG `IpPermissions` must cover every `(sourceCIDR, protocol, port)` tuple the source firewall allowed inbound. Missing → major per tuple.
+Target SG `IpPermissions` must cover every `(sourceCIDR, protocol, fromPort, toPort)` tuple the source firewall allowed inbound. Missing → major per tuple.
+
+A source rule is "covered" if there exists a target rule with the same (cidr, protocol) and a range that fully contains [fromPort, toPort]. If no target rule covers a source rule, emit `security.inbound.missing` with evidence containing the source rule's full tuple. Partial coverage (e.g., source 8000-9000 vs target 8000-8999) counts as missing — the uncovered sub-range is the `missing` tuple in evidence.
 
 Algorithm: compute `source_inbound_tuples - target_inbound_tuples`; emit one divergence per missing tuple.
 
@@ -141,14 +145,16 @@ Example divergence (port 8080 from 10.0.0.0/8 missing on target):
 {
   "type": "security.inbound.missing",
   "severity": "major",
-  "description": "Target SG has no inbound rule for (10.0.0.0/8, tcp, 8080) present on source firewall",
-  "evidence": {"cidr": "10.0.0.0/8", "protocol": "tcp", "port": 8080, "target_sg_ids": ["sg-xxx"]}
+  "description": "Target SG has no inbound rule for (10.0.0.0/8, tcp, 8080, 8080) present on source firewall",
+  "evidence": {"cidr": "10.0.0.0/8", "protocol": "tcp", "fromPort": 8080, "toPort": 8080, "target_sg_ids": ["sg-xxx"]}
 }
 ```
 
 #### Outbound
 
-Target SG `IpPermissionsEgress` must cover every `(destCIDR, protocol, port)` tuple the source firewall allowed outbound. Missing → major per tuple.
+Target SG `IpPermissionsEgress` must cover every `(destCIDR, protocol, fromPort, toPort)` tuple the source firewall allowed outbound. Missing → major per tuple.
+
+A source rule is "covered" if there exists a target rule with the same (cidr, protocol) and a range that fully contains [fromPort, toPort]. If no target rule covers a source rule, emit `security.outbound.missing` with evidence containing the source rule's full tuple. Partial coverage (e.g., source 8000-9000 vs target 8000-8999) counts as missing — the uncovered sub-range is the `missing` tuple in evidence.
 
 Algorithm: compute `source_outbound_tuples - target_outbound_tuples`; emit one divergence per missing tuple.
 
@@ -158,8 +164,8 @@ Example divergence (outbound to 203.0.113.0/24 port 443 missing):
 {
   "type": "security.outbound.missing",
   "severity": "major",
-  "description": "Target SG has no outbound rule for (203.0.113.0/24, tcp, 443) present on source firewall",
-  "evidence": {"cidr": "203.0.113.0/24", "protocol": "tcp", "port": 443, "target_sg_ids": ["sg-xxx"]}
+  "description": "Target SG has no outbound rule for (203.0.113.0/24, tcp, 443, 443) present on source firewall",
+  "evidence": {"cidr": "203.0.113.0/24", "protocol": "tcp", "fromPort": 443, "toPort": 443, "target_sg_ids": ["sg-xxx"]}
 }
 ```
 
@@ -220,6 +226,8 @@ Example divergence (target unexpectedly gets a public IP):
 
 **VPC membership:** All target resources for one VMware cluster should reside in one VPC or explicitly peered VPCs. Spread across unpeered VPCs → minor (architectural note only).
 
+This check is cluster-scoped rather than pair-scoped. It fires at most once per VMware cluster whose AWS resource pairs span multiple VPCs that are not peered.
+
 Example divergence:
 
 ```json
@@ -245,7 +253,7 @@ Example divergence (required tag "CostCenter" absent):
 
 ```json
 {
-  "type": "tags.missing",
+  "type": "tags.required-missing",
   "severity": "major",
   "description": "Required tag 'CostCenter' is absent from target EC2 i-0abc123",
   "evidence": {"missing_key": "CostCenter", "target_id": "i-0abc123", "target_tags": {"Name": "web-01", "Environment": "prod"}}
@@ -256,13 +264,13 @@ Example divergence (required tag "CostCenter" absent):
 
 ### Source-tag propagation (non-required)
 
-Tag keys in `source.tags[].category` absent from `target.tags` → minor. Advisory only; does not affect gate status.
+Tag keys in `source.tags[].category` absent from `target.tags` → minor. Advisory only; does not affect gate status. Applies only to tag keys not in the user-specified required-tags set.
 
 Example divergence:
 
 ```json
 {
-  "type": "tags.missing",
+  "type": "tags.propagation-missing",
   "severity": "minor",
   "description": "Source VM tag category 'app' has no corresponding key on target EC2 i-0abc123",
   "evidence": {"missing_key": "app", "source_tag_value": "web", "target_id": "i-0abc123"}
@@ -296,7 +304,7 @@ Quick-reference for common architectural patterns and the divergence triggered w
 |----------------------|-----------------|------------------------|
 | Public web tier (public IP + port 80/443 open) | Public ALB with HTTPS listener OR EC2 with EIP | `exposure.public-regression` — critical |
 | Internal API (private IP only, internal LB) | Private subnet + internal ALB/NLB, no public IP | `exposure.private-regression` — critical |
-| DB tier (private IP, port 3306 / 5432) | Private subnet RDS with SG restricting ingress to app-tier SG only | `exposure.private-regression` + `security.inbound.too-open` if ingress is over-broad |
+| DB tier (private IP, port 3306 / 5432) | Private subnet RDS with SG restricting ingress to app-tier SG only | `exposure.private-regression` + `security.inbound.extra-open` if ingress is over-broad |
 | Appliance VM (single NIC, managed access) | EC2 with equivalent SG set, public/private posture preserved from source | `exposure.*-regression` if posture changes |
 | Bastion / jump host (public IP, port 22 restricted) | EC2 with EIP, SG allowing port 22 from restricted CIDR only | `exposure.public-regression` if no EIP; `security.inbound.extra-open` if 0.0.0.0/0 added |
 
@@ -320,6 +328,7 @@ Summary of all divergence types produced by Phase 3, their default severity, and
 | `security.inbound.extra-open` | minor | — |
 | `exposure.public-regression` | critical | — |
 | `exposure.private-regression` | critical | — |
-| `tags.missing` | major (required-tags) / minor (source-tag propagation) | — |
+| `tags.required-missing` | major | — |
+| `tags.propagation-missing` | minor | — |
 | `tags.migration-tracking-absent` | minor | — |
 | `network.cross-vpc-fragmentation` | minor | — |
