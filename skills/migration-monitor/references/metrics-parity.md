@@ -73,9 +73,11 @@ curl -sS \
   -H "DD-API-KEY: ${DATADOG_API_KEY}" \
   -H "DD-APPLICATION-KEY: ${DATADOG_APP_KEY}" \
   --max-time 30 \
-  "https://api.datadoghq.com/api/v1/metrics?from=$(date -u -d '1 day ago' +%s)" \
+  "https://api.datadoghq.com/api/v1/metrics?from=$(( $(date -u +%s) - 86400 ))" \
   | jq -r '.metrics[]'
 ```
+
+> **Portability note.** The `$(( $(date -u +%s) - 86400 ))` arithmetic form works on GNU coreutils, macOS BSD `date`, and BusyBox `date`. Do NOT use `date -d '1 day ago'` (GNU-only) or `date -v-1d` (macOS-only).
 
 **Expected output:** Newline-separated metric names, e.g.:
 ```
@@ -192,13 +194,12 @@ This table is the centerpiece of Phase 5. Falcon matches source-side metric name
 | Source metric | CloudWatch equivalent | CloudWatch namespace |
 |---|---|---|
 | vROps `cpu\|usage_average` | `CPUUtilization` | `AWS/EC2` |
-| vROps `cpu\|ready_summation` | `CPUCreditBalance` (burstable only) | `AWS/EC2` |
 | vROps `mem\|usage_average` | `mem_used_percent` | `CWAgent` |
 | vROps `mem\|active_average` | `mem_used_percent` | `CWAgent` |
 | vROps `mem\|swapped_average` | `swap_used_percent` | `CWAgent` |
 | vROps `disk\|usage_average` | `disk_used_percent` | `CWAgent` |
 | vROps `disk\|commandsAveraged_average` | `DiskReadOps` + `DiskWriteOps` (sum) | `AWS/EC2` |
-| vROps `disk\|totalLatency_average` | `VolumeTotalReadTime` + `VolumeTotalWriteTime` (avg) | `AWS/EBS` |
+| vROps `disk\|totalLatency_average` | `VolumeTotalReadTime / VolumeReadOps` + `VolumeTotalWriteTime / VolumeWriteOps` (derived per-operation latency, weighted avg) | `AWS/EBS` |
 | vROps `net\|throughput_usage_average` | `NetworkIn` + `NetworkOut` (sum, bps) | `AWS/EC2` |
 | vROps `net\|packetsRx_summation` | `NetworkPacketsIn` | `AWS/EC2` |
 | vROps `net\|packetsTx_summation` | `NetworkPacketsOut` | `AWS/EC2` |
@@ -209,6 +210,7 @@ This table is the centerpiece of Phase 5. Falcon matches source-side metric name
 | Prom `rate(node_network_receive_bytes_total[5m])` | `NetworkIn` | `AWS/EC2` |
 | Prom `rate(node_network_transmit_bytes_total[5m])` | `NetworkOut` | `AWS/EC2` |
 | Prom `http_request_duration_seconds{quantile="0.95"}` | `TargetResponseTime` (p95) | `AWS/ApplicationELB` |
+| Prom `histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))` | `TargetResponseTime` (p95) | `AWS/ApplicationELB` |
 | Prom `rate(http_requests_total{status=~"5.."}[5m])` | `HTTPCode_Target_5XX_Count` | `AWS/ApplicationELB` |
 | Prom `rate(http_requests_total[5m])` | `RequestCount` | `AWS/ApplicationELB` |
 | Datadog `system.cpu.user + system.cpu.system` | `CPUUtilization` | `AWS/EC2` |
@@ -219,8 +221,6 @@ This table is the centerpiece of Phase 5. Falcon matches source-side metric name
 | New Relic `system.cpuPercent` | `CPUUtilization` | `AWS/EC2` |
 | New Relic `system.memoryUsedPercent` | `mem_used_percent` | `CWAgent` |
 | New Relic `system.diskUsedPercent` | `disk_used_percent` | `CWAgent` |
-| RDS-level Prom `rate(pg_stat_database_tup_fetched[5m])` | `ReadIOPS` | `AWS/RDS` |
-| RDS-level Prom `rate(pg_stat_database_tup_inserted + pg_stat_database_tup_updated + pg_stat_database_tup_deleted)[5m]` | `WriteIOPS` | `AWS/RDS` |
 | RDS-level Prom `pg_stat_activity_count` | `DatabaseConnections` | `AWS/RDS` |
 
 ### Dimensions note
@@ -242,6 +242,12 @@ Where the CloudWatch equivalent shows a compound expression, Falcon applies the 
 - **Sum:** `DiskReadOps + DiskWriteOps`, `NetworkIn + NetworkOut` — fetch both metrics, sum the time-series values point-by-point before computing percentiles.
 - **Average:** `VolumeTotalReadTime + VolumeTotalWriteTime (avg)` — fetch both metrics, average the time-series values point-by-point before computing percentiles.
 - **Inverted:** `disk_used_percent (inverted)` for the Prometheus `node_filesystem_avail_bytes` ratio — Falcon computes `100 - source_value` before comparison since Prometheus returns available fraction while CloudWatch reports used percent. Similarly, `system.mem.pct_usable (inverted)` from Datadog is `100 - source_value`.
+
+**EBS latency derivation.** CloudWatch EBS does not emit per-operation latency directly. Falcon MUST compute it from the raw metrics: `read_latency_s = VolumeTotalReadTime / VolumeReadOps` and `write_latency_s = VolumeTotalWriteTime / VolumeWriteOps`. Use a weighted average across read/write: `avg_latency = (VolumeTotalReadTime + VolumeTotalWriteTime) / (VolumeReadOps + VolumeWriteOps)`. Guard against divide-by-zero when `ReadOps + WriteOps == 0` (idle volume) — emit `metrics.insufficient-samples` for that interval.
+
+**Network metric units.** CloudWatch `NetworkIn` / `NetworkOut` are reported in **bytes per monitoring period** (typically 60s), not bytes per second. Prometheus `rate(node_network_*_bytes_total[5m])` returns **bytes per second**. When comparing: divide CloudWatch values by the CloudWatch period in seconds (derived from the returned `Period` field of the metric statistic). Alternatively, convert Prometheus rate to per-period by multiplying by 60. The comparison window and aggregation strategy must be consistent across both sides.
+
+**Database logical vs physical IOPS.** PostgreSQL's `pg_stat_database_tup_fetched` counts logical row fetches (served from shared buffer cache when hot) — it does not correspond to physical disk IOPS that CloudWatch `ReadIOPS` measures. Mapping these directly will produce misleading divergences (e.g., a well-cached workload shows 10k tup_fetched/s but 100 ReadIOPS — that's healthy, not a regression). Falcon MUST NOT map logical DB counters to physical IOPS. For RDS physical IOPS parity, use CloudWatch `ReadIOPS` / `WriteIOPS` on the target and rely on source-side OS-layer metrics (node_exporter `node_disk_reads_completed_total` rate on the source VM's underlying disk) for comparison, or skip this comparison entirely if source doesn't have OS-layer disk telemetry.
 
 ---
 
@@ -337,9 +343,10 @@ Falcon computes percentiles from raw time-series data piped as one value per lin
 
 ```bash
 sort -n | awk 'BEGIN{c=0} {a[c++]=$1} END{
+  if (c == 0) { print "ERROR: insufficient-samples"; exit 2 }
   p50=a[int(c*0.5)]; p95=a[int(c*0.95)]; p99=a[int(c*0.99)];
   sum=0; for(i=0;i<c;i++) sum+=a[i]; mean=sum/c;
-  printf "p50=%g p95=%g p99=%g mean=%g\n", p50, p95, p99, mean
+  printf "p50=%g p95=%g p99=%g mean=%g n=%d\n", p50, p95, p99, mean, c
 }'
 ```
 
@@ -350,10 +357,16 @@ Usage: pipe raw values (one per line) into this command.
 ```bash
 python3 -c "import sys, statistics as s
 v = sorted(float(x) for x in sys.stdin if x.strip())
-print(f'p50={v[int(len(v)*0.5)]} p95={v[int(len(v)*0.95)]} p99={v[int(len(v)*0.99)]} mean={s.mean(v)}')"
+if not v: sys.exit(2)
+if len(v) < 100:
+    print(f'p50={v[int(len(v)*0.5)]} p95={v[int(len(v)*0.95)]} p99={v[int(len(v)*0.99)]} mean={s.mean(v)} n={len(v)} low-confidence=true')
+else:
+    print(f'p50={v[int(len(v)*0.5)]} p95={v[int(len(v)*0.95)]} p99={v[int(len(v)*0.99)]} mean={s.mean(v)} n={len(v)}')"
 ```
 
 Usage: pipe raw values (one per line) into this command.
+
+> **Empty-series handling.** Exit code 2 signals insufficient samples — Falcon MUST treat this as trigger for `metrics.insufficient-samples` divergence (minor severity) rather than attempting statistical comparison. The low-count threshold (<100 points) produces a `low-confidence=true` annotation; <1 point produces a hard failure.
 
 ### Selection logic
 
@@ -414,6 +427,14 @@ If a source-side metric enumerated from the catalog has no matching entry in the
 ```
 
 Unmapped metrics accumulate in the Phase 7 report under a dedicated "Unmapped Metrics" section so operators can decide whether to add custom CloudWatch metrics or accept the gap.
+
+### Intentionally unmapped source concepts
+
+Some VMware-layer metrics have no AWS equivalent and MUST NOT be mapped:
+
+- **CPU ready time** (vROps `cpu|ready_summation`, Prom `vmware_vm_cpu_ready`): hypervisor-layer contention indicator; has no AWS analog (AWS manages its hypervisor internally). Emit `metrics.unmapped` with note "VMware-only: CPU ready time is a hypervisor contention metric; post-migration, use `CPUUtilization` instead — if target CPU is consistently pegged and source showed high ready time, that indicates the migration reached CPU headroom without resolving contention."
+- **Co-stop time** (vROps `cpu|costop_summation`): same as above — SMP coordination overhead, no AWS analog.
+- **Hypervisor swap / ballooning** (vROps `mem|swapped_average`, `mem|vmmemctl_average`): VMware memory reclamation; AWS doesn't have ballooning. Emit `metrics.unmapped` with note to use `mem_used_percent` from CW Agent on target.
 
 ---
 
