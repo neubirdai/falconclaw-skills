@@ -47,22 +47,23 @@ Passwords MUST NOT be constructed as shell positional arguments visible in `ps` 
 #### MySQL
 
 ```bash
-# MySQL — passwords read from env
+# MySQL — MYSQL_PWD env var is the required form (not visible in ps -ef)
+MYSQL_PWD="$DB_PASSWORD" \
 mysql -h "$HOST" -P "$PORT" -u "$USER" \
   -D "$DB" \
   -N -B \
-  --password="$DB_PASSWORD" \
   --connect-timeout=10 \
   -e "SELECT ...;"
 ```
 
-Note: MySQL's `-p"$DB_PASSWORD"` form is shown in older docs; prefer `--password="$DB_PASSWORD"` for clarity. Some MySQL clients warn about passing the password via CLI. The `MYSQL_PWD` environment variable is an alternative: set `MYSQL_PWD="$DB_PASSWORD"` and omit the `--password` flag. However, `MYSQL_PWD` has the same process-environment visibility concerns as other env vars — prefer the `--password` flag form for explicitness and rely on file-descriptor isolation at the OS level.
+`MYSQL_PWD` is the REQUIRED form for passing the MySQL password. Unlike `--password=`, `MYSQL_PWD` is not visible in `ps -ef` output (it is only readable via `/proc/<pid>/environ` by the same user or root). Using `--password=` on the command line IS visible in `ps -ef` and is strongly discouraged. The `--password=` flag is a fallback only for environments that cannot set environment variables at all; if it must be used, the exposure must be explicitly accepted by the user.
 
 #### PostgreSQL
 
 ```bash
-# PostgreSQL — PGPASSWORD env takes precedence
+# PostgreSQL — PGPASSWORD + PGCONNECT_TIMEOUT env vars
 PGPASSWORD="$DB_PASSWORD" \
+PGCONNECT_TIMEOUT=10 \
 psql -h "$HOST" -p "$PORT" -U "$USER" \
      -d "$DB" \
      -t -A \
@@ -75,15 +76,16 @@ psql -h "$HOST" -p "$PORT" -U "$USER" \
 #### SQL Server
 
 ```bash
-# SQL Server
-sqlcmd -S "$HOST,$PORT" -U "$USER" -P "$DB_PASSWORD" \
+# SQL Server — SQLCMDPASSWORD env var is the required form
+SQLCMDPASSWORD="$DB_PASSWORD" \
+sqlcmd -S "$HOST,$PORT" -U "$USER" \
        -d "$DB" \
        -h -1 -W \
        -l 10 \
        -Q "SELECT ...;"
 ```
 
-Security note: `sqlcmd` passes the password via the `-P` flag, which is visible in `ps` output on most operating systems. This is a known limitation of `sqlcmd`. When the `SQLCMDPASSWORD` environment variable is set, `sqlcmd` reads it without requiring the `-P` flag; Falcon SHOULD set `SQLCMDPASSWORD="$DB_PASSWORD"` and omit the `-P` flag when the installed `sqlcmd` version supports it. Verify support before relying on the env-var form in production.
+`SQLCMDPASSWORD` is the REQUIRED form. It has been supported since SQL Server 2005; all in-scope versions (2017+) support it. Setting `SQLCMDPASSWORD` avoids exposing the password in `ps` output. The `-P` flag is a discouraged fallback only for legacy environments where environment variables cannot be set; its use must be explicitly accepted by the user.
 
 ### Connection timeout summary
 
@@ -133,6 +135,14 @@ SELECT TABLE_SCHEMA + '.' + TABLE_NAME AS qualified_name
 ```
 
 System schemas `sys` and `INFORMATION_SCHEMA` are excluded. The result is fully qualified `schema.table`.
+
+### Cross-engine qualifier normalization
+
+When source and target engines differ (e.g., MySQL source migrated to PostgreSQL target), Falcon normalizes table names before comparison:
+
+- If the source is MySQL (no schema), add a default schema prefix to match the target convention (PostgreSQL typically uses `public`, SQL Server uses `dbo`). Falcon uses `--target-default-schema <name>` (default: `public` for PostgreSQL, `dbo` for SQL Server) to pick the prefix.
+- For same-engine pairs (e.g., PostgreSQL source → PostgreSQL target in RDS), schema identity is preserved — `public.users` on source must match `public.users` on target, not `custom_schema.users`.
+- Cross-engine comparisons are lossy in schema identity; Falcon emits an informational note at the top of the data-parity section of the report explaining the normalization applied.
 
 ### Comparison logic
 
@@ -194,10 +204,27 @@ SELECT COUNT(*) FROM <qualified_table_name>
 | PostgreSQL | Timestamptz cast `'2026-04-24T00:00:00Z'::timestamptz` or plain string `'2026-04-24 00:00:00'` (adjust per column type) | `'2026-04-24T00:00:00Z'::timestamptz` |
 | SQL Server | Quoted string `'2026-04-24 00:00:00'` (adjust per column type) | `'2026-04-24 00:00:00'` |
 
+### Cutoff value source
+
+The cutoff value comes from the USER at Phase 6 invocation time, not from automatic derivation. Users who know their migration's CDC replication is still running can specify a timestamp before the cutover started (e.g., `--cutoff-field updated_at --cutoff-value '2026-04-20 00:00:00'`) to restrict counts to rows guaranteed to exist on both sides.
+
+If no cutoff is provided, Falcon uses the raw `COUNT(*)` queries. Without a cutoff, replication lag can cause spurious `data.rowcount.deficit` divergences — Falcon flags this risk in the report if the user has reported an active CDC state but no cutoff field.
+
+Falcon MUST NOT auto-derive a cutoff (e.g., "now minus 1 hour") because (a) clock skew between source and target is unknowable and (b) the correct cutoff depends on application-level write patterns that Falcon cannot inspect.
+
 ### Tolerance
 
 - **Default tolerance:** within 1%. Divergence fires when `abs(source_count - target_count) / source_count > 0.01`. A 1% band accounts for rows in-flight during CDC replication and normal write activity during the check window.
 - **Strict mode** (`--strict-row-count` flag): 0% tolerance. Any count difference triggers a divergence, regardless of magnitude.
+
+#### Empty-table handling
+
+The formula above divides by `source_count` and crashes when `source_count == 0`. Falcon applies the following rules before evaluating the tolerance formula:
+
+- `source_count == 0 AND target_count == 0`: no divergence (tables are equivalent).
+- `source_count == 0 AND target_count > 0`: emit `data.rowcount.surplus` with `deficit_pct: null`, severity minor.
+- `source_count > 0 AND target_count == 0`: emit `data.rowcount.deficit` with `deficit_pct: 1.0` (100% deficit), severity critical.
+- `source_count > 0 AND target_count > 0`: compute `delta_pct = abs(source_count - target_count) / source_count`. Apply normal tolerance rules (1% default / 10% critical).
 
 ### Divergence classification
 
