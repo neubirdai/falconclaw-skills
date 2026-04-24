@@ -94,8 +94,7 @@ Phase 7 emits the following JSON structure. Field descriptions follow the exampl
   count as 1 (not additive).
 - `skipReasons` — map of phase name → human-readable reason string, one entry per phase listed in
   `summary.skippedPhases`. Populated from Phase 0 surface-availability log.
-- `comparisonWindow` — the source and target time windows used for metrics parity (Phase 5). Captured
-  from Phase 5 output; absent if Phase 5 was skipped.
+- `comparisonWindow` — Optional — present only if Phase 5 ran. Absent if metrics parity was skipped. The source and target time windows used for metrics parity (Phase 5). Captured from Phase 5 output.
 - `phases.infra` / `phases.endpoint` / `phases.metrics` / `phases.data` — arrays of divergence
   objects per phase. An empty array (`[]`) means the phase ran and found no divergences. A missing
   key means the phase was skipped (reconstruct from `summary.skippedPhases`).
@@ -149,7 +148,7 @@ before sign-off.
 
 Examples:
 - 30–50% metrics regression (CPU, memory, latency, error rate)
-- 10–30% DB row count deficit on a paired table (`data.rowcount.deficit`)
+- 1–10% DB row count deficit on a paired table (`data.rowcount.deficit`). Deficit >10% escalates to critical.
 - vCPU or memory below 80% of source provisioned level (`compute.vcpu-deficit`, `compute.memory-deficit`)
 - Missing security group inbound or outbound rule (`security.inbound.missing`, `security.outbound.missing`)
 - Missing required security header on target endpoint (`endpoint.security-header-missing`)
@@ -210,6 +209,7 @@ opaque — do not parse placeholders programmatically.
 
 | Divergence type | Remediation hint template |
 |---|---|
+| `network.cross-vpc-fragmentation` | AWS resources for a cluster span multiple VPCs. Consolidate to one VPC or add Transit Gateway peering. `aws ec2 create-transit-gateway-peering-attachment --transit-gateway-id <tgw-id> --peer-transit-gateway-id <peer>`. |
 | `compute.vcpu-deficit` | Resize instance to at least `<suggested_type>`: `aws ec2 modify-instance-attribute --instance-id <aws_id> --instance-type Value=<suggested_type>`. Web-search current AWS EC2 instance types in `<region>` before applying. |
 | `compute.memory-deficit` | Resize to memory-optimized family (r7i/r7a) or larger compute family: `aws ec2 modify-instance-attribute --instance-id <aws_id> --instance-type Value=<suggested_type>`. |
 | `compute.os-mismatch` | OS family mismatch typically requires re-provisioning. Verify AMI OS family matches source. Cannot be fixed in-place. |
@@ -224,6 +224,7 @@ opaque — do not parse placeholders programmatically.
 | `exposure.private-regression` | Target is publicly exposed; source was private. Remove public IP / public-facing LB. Move to private subnet. |
 | `tags.required-missing` | Add required tags: `aws ec2 create-tags --resources <aws_id> --tags Key=<k>,Value=<v>`. |
 | `tags.propagation-missing` | Source tag not propagated to target. Optional: replicate via `aws ec2 create-tags`. |
+| `tags.migration-tracking-absent` | Informational — migration-tracking tags (`migration-wave`, `migration-source-vm-id`, etc.) not present. v1 doesn't require them; add for traceability via `aws ec2 create-tags --resources <aws_id> --tags Key=migration-source-vm-id,Value=<vmware_id>`. |
 | `endpoint.status-mismatch` | Check ALB target-group health: `aws elbv2 describe-target-health --target-group-arn <arn>`. Inspect app-side config, reverse proxy rules. Check 5xx root cause in CloudWatch Logs for the relevant log group. |
 | `endpoint.reachability-regression` | Verify security group / NACL / route table / subnet. Confirm LB listener matches source port. `aws ec2 describe-network-acls --filters Name=vpc-id,Values=<vpc_id>` to inspect NACLs. |
 | `endpoint.tls-expired` | Renew certificate. If ACM-managed: `aws acm list-certificates --certificate-statuses EXPIRED` to find. If self-managed, coordinate with ops for renewal. |
@@ -231,12 +232,27 @@ opaque — do not parse placeholders programmatically.
 | `endpoint.body-structural-mismatch` | Application-layer divergence — not infra. Inspect app config, version pin, migration-time code changes. Compare app versions source vs target. |
 | `endpoint.security-header-missing` | Add missing security header to the target's web server, reverse proxy, or ALB response rules. For ALB: use a response-header modification rule in the listener. |
 | `endpoint.tls-handshake-failure` | TLS handshake failed on `<side>`. Check SG allows port 443 from Falcon's IP. Verify certificate is installed and the TLS listener is active. `aws elbv2 describe-listeners --load-balancer-arn <arn>`. |
+| `endpoint.content-type-mismatch` | Target returns different Content-Type than source. Inspect application config, caching layer, or reverse-proxy rewrite rules. Check ALB listener rules for content-type manipulation. |
+| `endpoint.size-deviation` | Target response body size deviates from source by >50%. Inspect application-layer changes, compression (gzip/br) enabled/disabled differently, or payload version drift. |
+| `endpoint.body-html-drift` | Target HTML differs structurally from source after normalization. Often benign (framework upgrade, template regeneration). Compare rendered output manually; escalate to major only if user-facing impact confirmed. |
+| `endpoint.body-bytes-mismatch` | Non-JSON/HTML body bytes differ. Target may serve a different binary asset version. Compare asset hashes and deployment manifests. |
+| `endpoint.unreachable` | Target endpoint unreachable at curl level (network failure / connection refused). Check target host is running, security groups allow Falcon's IP, DNS resolves. `aws ec2 describe-instances --instance-ids <aws_id> --query 'Reservations[].Instances[].State.Name'`. |
+| `endpoint.tls-pre-valid` | Target TLS cert is not-yet-valid (notBefore in future). Cert was issued with incorrect date or system clock skew exists. Verify cert issuance time; renew if needed. |
+| `endpoint.both-unreachable` | Neither source nor target is reachable. Often indicates source was decommissioned during migration. Informational — verify this was intentional. |
 | `metrics.regression` (any severity) | Investigate root cause by metric: CPU/memory regression → scale up instance type, enable CloudWatch target-tracking scaling, investigate noisy-neighbor on shared tenancy; latency regression → inspect app-side config for cold-start, N+1 queries, cache hit rates; error-rate regression → `aws logs filter-log-events` on ALB access logs and app logs. |
 | `metrics.unmapped` | Source metric has no CloudWatch equivalent in v1 mapping table. Manually correlate or request mapping-table extension in future skill release. |
+| `metrics.source-unavailable` | Catalog enumeration on a metric source (Prometheus/Datadog/etc.) failed. Check credentials (`PROMETHEUS_URL`, `DATADOG_API_KEY`, etc.), network reachability, service health. |
+| `metrics.insufficient-samples` | Fewer than required data points for statistical comparison. Extend comparison window or verify metric emission frequency. Skip this metric's divergence this run. |
 | `data.table.missing-on-target` | Migration incomplete — source table absent on target. Check DMS replication task status: `aws dms describe-replication-tasks --filters Name=replication-instance-arn,Values=<arn>`. Restart or extend task. |
 | `data.rowcount.deficit` | If DMS CDC still running, wait for lag to drain; check `aws dms describe-replication-tasks` for `PendingChanges`. Otherwise investigate replication errors in CloudWatch Logs for the task. |
 | `data.column.missing-on-target` | Schema regression. Compare schemas: `\d+ <table>` (psql) or `SHOW CREATE TABLE <table>` (mysql). Reapply missing schema changes via migration tool (Flyway / Liquibase). |
 | `data.connection-failure` | Cannot reach target DB. Check security group allows Falcon's IP on DB port. Check RDS status: `aws rds describe-db-instances --db-instance-identifier <id>`. |
+| `data.table.extra-on-target` | Target has tables source doesn't. Often expected schema evolution post-migration. Informational — verify tables are intentional additions, not replication errors. |
+| `data.rowcount.surplus` | Target has more rows than source. May indicate duplicate inserts from replication restart or data-imports run twice. Investigate DMS task history for restart events. |
+| `data.column.extra-on-target` | Target table has columns source doesn't. Often expected schema evolution. Verify columns are intentional via schema-migration tool history. |
+| `data.column.position-mismatch` | Same-named columns in different ordinal positions. Applications using `SELECT *` or positional column binding may break. Consider re-ordering via migration or explicit column lists in SQL. |
+| `data.engine-unavailable` | Required DB CLI (`mysql`/`psql`/`sqlcmd`) not on Falcon's PATH. Install the engine client in Falcon's execution environment, or skip DB parity for this engine. |
+| `data.query-timeout` | SQL query exceeded timeout (default 5 minutes). Table is very large, or engine is under heavy load. Try during off-peak, or exclude the table with `--exclude-table <pattern>` for this run. |
 
 ---
 
@@ -321,11 +337,17 @@ How Falcon builds the report at Phase 7:
    divergence in the report. The severity is inherited as emitted by the phase. Phase 7 annotates
    `summary` with an `unknownTypeCount` field counting these occurrences.
 
+### Re-run behavior
+
+> **Re-run behavior.** Each Phase 7 run produces a fresh report from the current Phase 3–6 outputs. Prior-session dispositions (accepted / investigate / blocker) are NOT automatically re-applied. If a user accepted a divergence in one session, it will re-appear in the next session's report unless the underlying condition has been remediated. This is intentional — the report reflects current state, not historical human judgment. Users who need persistent dispositions must track them externally.
+
 ---
 
 ## Consumer guidance
 
 Pointers for downstream tools and operators that consume the divergence report:
+
+> **Placeholder warning.** Remediation hint strings contain `<placeholder>` tokens that Falcon substitutes at emit time. **Before executing any hint in a shell, verify that all `<…>` tokens have been substituted.** Unresolved placeholders will be interpreted by the shell as input redirection and fail. Consumers parsing hints programmatically must also treat unresolved placeholders as a substitution failure.
 
 - **Match on `type`, not `description`.** The `type` field (e.g., `compute.vcpu-deficit`) is the
   stable contract across skill versions. The `description` field is human-prose and may change
