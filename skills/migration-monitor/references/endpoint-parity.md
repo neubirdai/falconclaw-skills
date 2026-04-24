@@ -55,6 +55,8 @@ Falcon builds the following JSON structure from the Phase 1 mapping before Phase
 }
 ```
 
+**PAIR_ID constraint.** `PAIR_ID` values must match `[a-zA-Z0-9_-]+`. Falcon MUST sanitize IDs built from user-supplied resource names before using them in file paths or command substitutions. Invalid characters are replaced with `_`.
+
 ---
 
 ## HTTP probe recipe
@@ -66,22 +68,26 @@ For each pair with `"http"` in `probe_types`, Falcon emits these exact commands 
 ```bash
 # Source side
 curl -sS \
-     -o /tmp/mmon_source_body_${PAIR_ID}.out \
-     -D /tmp/mmon_source_headers_${PAIR_ID}.out \
+     -o "/tmp/mmon_source_body_${PAIR_ID}.out" \
+     -D "/tmp/mmon_source_headers_${PAIR_ID}.out" \
      -w '%{http_code}\n%{time_total}\n%{content_type}\n%{size_download}\n' \
      --max-time 30 \
      "$SOURCE_URL"
 
 # Target side (same flags, different output paths)
 curl -sS \
-     -o /tmp/mmon_target_body_${PAIR_ID}.out \
-     -D /tmp/mmon_target_headers_${PAIR_ID}.out \
+     -o "/tmp/mmon_target_body_${PAIR_ID}.out" \
+     -D "/tmp/mmon_target_headers_${PAIR_ID}.out" \
      -w '%{http_code}\n%{time_total}\n%{content_type}\n%{size_download}\n' \
      --max-time 30 \
      "$TARGET_URL"
 ```
 
 When the `$AUTH_HEADER` environment variable is set (e.g. `Authorization: Bearer xxx`), append `--header "$AUTH_HEADER"` to both commands. The `--max-time 30` flag is mandatory and must not be removed; it prevents hung probes from blocking Phase 4 indefinitely.
+
+**Quoting.** `$AUTH_HEADER` contains a space (e.g. `Authorization: Bearer <token>`). Always expand with outer double quotes: `--header "$AUTH_HEADER"`. Falcon MUST NOT split this into separate token / header-name variables.
+
+**Note.** The source and target curl invocations are intentionally spelled out separately. Do NOT collapse into a loop over an array — the explicit form preserves independent stderr streams and makes command-level failures attributable to the correct side.
 
 ### b. Status and performance comparison rules
 
@@ -204,10 +210,12 @@ For each pair with `"tls"` in `probe_types`, Falcon fetches certificate details 
 
 ```bash
 # For each side, fetch cert details
-echo | openssl s_client -connect "$HOST:$PORT" -servername "$HOST" 2>/dev/null \
+echo | timeout 30 openssl s_client -connect "$HOST:$PORT" -servername "$HOST" 2>/dev/null \
   | openssl x509 -noout -dates -subject -issuer \
-  > /tmp/mmon_tls_${PAIR_ID}_${SIDE}.txt
+  > "/tmp/mmon_tls_${PAIR_ID}_${SIDE}.txt"
 ```
+
+`timeout 30` prefix prevents a hung TLS handshake from blocking Phase 4 indefinitely.
 
 This command is read-only: it connects, reads the certificate, then closes immediately. No data is written to the server.
 
@@ -232,6 +240,8 @@ The target certificate's subject CN must match the endpoint hostname being probe
 Record both the source and target issuers. If the issuer families differ (e.g., LetsEncrypt on source, AWS ACM on target, or corporate CA on source), this is **informational** — a different CA is acceptable as long as the certificate is valid and the CN check passes. Record issuer details in evidence for audit purposes but do not emit a divergence.
 
 **Note:** v1 does not attempt chain-trust equivalence between source and target. Verifying full trust chains requires matching trust stores, which differ across operating systems and environments. Chain-trust equivalence is deferred to v1.1.
+
+If the `timeout 30 openssl s_client` pipeline exits non-zero (handshake failure, refused connection, DNS failure, cert unreadable), emit `endpoint.tls-handshake-failure` — critical. Evidence must include which side failed and the exit code.
 
 Example divergence (expired target certificate):
 
@@ -263,6 +273,16 @@ Example divergence (expired target certificate):
 
 Every Phase 4 divergence follows the shape the report schema formalizes in Task 8:
 
+**Minimum evidence fields.** Every Phase 4 divergence's `evidence` object MUST include:
+- `probe`: one of `"http"`, `"tcp"`, `"tls"` (identifies which probe type produced the divergence).
+
+Probe-type-specific fields that SHOULD be present:
+- **HTTP probes:** `source_url` and `target_url`.
+- **TCP probes:** `source_host`, `source_port`, `target_host`, `target_port`.
+- **TLS probes:** `host`, `port`, `side` (`source` or `target`) identifying which side's cert the evidence describes. Divergences comparing both sides include both `source_*` and `target_*` keyed by field (e.g., `source_subject_cn` / `target_subject_cn`).
+
+Downstream consumers (Task 8 report renderer) MUST tolerate absent probe-type-specific fields and present evidence generically via key/value enumeration.
+
 ```json
 {
   "id": "endpoint-001",
@@ -288,14 +308,14 @@ Required fields on every divergence:
 
 - `id` — unique string within the Phase 4 run (e.g., `endpoint-NNN`).
 - `phase` — always `"endpoint"` for Phase 4 divergences.
-- `type` — one of the 13 divergence type strings defined in the classification matrix below.
+- `type` — one of the 14 divergence type strings defined in the classification matrix below.
 - `severity` — one of `"critical"`, `"major"`, `"minor"`, `"informational"`.
 - `resourcePair` — the VM-to-EC2 pair from Phase 1 mapping.
 - `pairId` — the endpoint pair `id` from the pair list structure.
 - `description` — human-readable summary of what differs.
 - `evidence` — structured object with probe-type-specific fields.
 
-All 13 divergence types produced by Phase 4:
+All 14 divergence types produced by Phase 4:
 
 | Divergence type | Severity |
 |---|---|
@@ -312,6 +332,7 @@ All 13 divergence types produced by Phase 4:
 | `endpoint.tls-expired` | critical |
 | `endpoint.tls-pre-valid` | critical |
 | `endpoint.tls-cn-mismatch` | major |
+| `endpoint.tls-handshake-failure` | critical |
 
 ---
 
@@ -334,3 +355,4 @@ Summary of all divergence types produced by Phase 4, their severity, and the pro
 | `endpoint.tls-expired` | critical | tls | Target certificate notAfter is in the past |
 | `endpoint.tls-pre-valid` | critical | tls | Target certificate notBefore is in the future |
 | `endpoint.tls-cn-mismatch` | major | tls | Target certificate CN does not match probed hostname |
+| `endpoint.tls-handshake-failure` | critical | tls | `timeout 30 openssl s_client` exits non-zero (handshake failure, DNS failure, connection refused, cert unreadable); evidence includes `side`, `host`, `port`, `exit_code`, `stderr_sample` |
