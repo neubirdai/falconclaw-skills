@@ -230,7 +230,9 @@ for vm in vmware_inventory:
   candidates = []
   for aws in aws_inventory:
     if aws.type not in applicable_types(vm):
-      continue                 # don't pair a VM with an S3 bucket
+      continue                      # don't pair a VM with an S3 bucket
+    if aws.id in aws_claimed:
+      continue                      # already assigned to a high-confidence pair
     score = sum(signal_weight for signal in applicable_signals(vm, aws))
     if score > 0:
       candidates.append((aws, score, signals_hit))
@@ -244,8 +246,10 @@ for vm in vmware_inventory:
   else:
     unresolved_vmware.append(vm)
 
-unresolved_aws = [a for a in aws_inventory if a.id not in aws_claimed
-                 and not in any ambiguous candidate set]
+ambiguous_claimed = {c.aws.id for (vm, top3) in ambiguous for c in top3}
+unresolved_aws = [a for a in aws_inventory
+                  if a.id not in aws_claimed
+                  and a.id not in ambiguous_claimed]
 
 return pairs, ambiguous, unresolved_vmware, unresolved_aws
 ```
@@ -294,6 +298,11 @@ Unresolved VMware VMs — provide an AWS resource ID or mark out-of-scope:
   vm-1999  (2 vCPU, 4 GB, Windows Server 2019, no IP match)
     Pair with AWS resource ID: ___ (or type "out-of-scope")
 ```
+
+**Out-of-scope declarations.** During Gate 2 review, the user may declare any VMware
+workload out-of-scope for monitoring (for example: archive VMs, decommissioned workloads,
+VMs intentionally not migrated). Such VMs move from `unresolved_vmware` or `ambiguous`
+into `skipped_vmware` in the final mapping output. They are excluded from Phases 3–7.
 
 **Unresolved AWS group:** AWS resources not claimed by any pair or ambiguous candidate are presented for disposition. Options: pair with a VMware VM ID, or declare as "native AWS, not a migration target."
 
