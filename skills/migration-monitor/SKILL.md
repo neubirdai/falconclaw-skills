@@ -38,6 +38,7 @@ Run these read-only probes first every session. Determine which parity surfaces 
 | AWS reachable | `aws sts get-caller-identity` | account ID + active region |
 | vCenter reachable | `govc about` (only if `GOVC_URL` + `GOVC_USERNAME` set) | live VMware discovery |
 | Static VMware exports | look for `RVTools*.xlsx` / `RVTools*.csv` in cwd | RVTools fallback if no live vCenter |
+| GitHub VMware configs | `gh auth status` succeeds AND (`MIGRATION_MONITOR_VMWARE_REPO=<owner>/<repo>` is set OR user can name the repo at Gate 1) | scan repo for RVTools exports, Terraform vSphere, VCF/Aria templates, OVF descriptors |
 | Metric sources | env-var scan: `PROMETHEUS_URL`, `DATADOG_API_KEY` + `DATADOG_APP_KEY`, `NEW_RELIC_API_KEY` + `NEW_RELIC_ACCOUNT`, `VROPS_URL` + `VROPS_USERNAME` | queryable metric sources |
 | Endpoint probing | `curl --version` | HTTP/TCP diff available |
 | TLS checks | `openssl version` | TLS cert validation available |
@@ -45,12 +46,14 @@ Run these read-only probes first every session. Determine which parity surfaces 
 
 **Available-surfaces rules:**
 
-- **Required** (block if missing): AWS + (live vCenter OR RVTools export).
+- **Required** (block if missing): AWS + (live vCenter OR RVTools export in cwd OR GitHub repo with VMware configs OR raw VMware IaC in cwd). Sources are tried in priority order — see `references/probe-and-map.md`.
 - **Optional** (skip phase with logged reason if absent):
   - Endpoint parity requires `curl`.
   - TLS checks require `openssl`.
   - Metrics parity requires ≥1 metric source.
   - DB parity requires both source and target DB URIs + passwords.
+
+**GitHub-first scan order.** When GitHub access is available (`gh auth status` ok), Phase 2 scans the connected repo BEFORE falling back to cwd file discovery. A repo with an `RVTools_*.xlsx` is preferred over local CSVs (the repo is the team's source of truth); raw IaC in the repo (`*.tf` with `vsphere_*` resources, VCF Automation YAML, Aria blueprints, `*.ovf`) is used as a third-priority fallback when no exports exist anywhere. The full priority chain is documented in `references/probe-and-map.md`.
 
 Present the surface checklist as a summary and **stop at Gate 1** for user confirmation. User may adjust env and re-run Phase 0 rather than proceed.
 
@@ -66,7 +69,15 @@ Present pairing results grouped as auto-paired / ambiguous / unresolved, and **s
 
 Enumerate state on both sides using Falcon's native CLI capabilities. Do not filter by tags — the discovery must be comprehensive because no single signal (tags included) is trustworthy for scoping.
 
-Exact discovery command lists (AWS `describe-*` verbs, `govc *.info` commands, RVTools tab mapping) are in `references/probe-and-map.md`. Falcon executes them, parses outputs, and assembles the canonical in-memory inventory shape documented there.
+VMware-side source priority (try in order; stop at first that yields an inventory):
+
+1. **Live vCenter** via `govc *.info` — highest fidelity, current state.
+2. **RVTools export from GitHub** — `gh api` to fetch `RVTools_*.xlsx` / `RVTools_*.csv` from the repo declared by `MIGRATION_MONITOR_VMWARE_REPO`. Treats the repo as the team's source of truth for inventory snapshots.
+3. **RVTools export in cwd** — local fallback when no GitHub repo is available or no export found there.
+4. **Raw VMware IaC from GitHub** — Terraform vsphere provider, VCF Automation YAML, Aria blueprints, OVF descriptors discovered via `gh api search/code`. Lower fidelity (declared intent, not live state) but better than nothing.
+5. **Raw VMware IaC in cwd** — same parsers, local fallback.
+
+Exact discovery command lists (AWS `describe-*` verbs, `govc *.info` commands, RVTools tab mapping, GitHub scan recipes, raw-IaC parsers) are in `references/probe-and-map.md`. Falcon executes them, parses outputs, and assembles the canonical in-memory inventory shape documented there.
 
 ## Phase 3: Infrastructure Parity
 

@@ -116,14 +116,53 @@ Required: `SOURCE_DB_URI` AND `SOURCE_DB_PASSWORD` AND `TARGET_DB_URI` AND `TARG
 
 ---
 
+### Probe 8: GitHub VMware Configs
+
+Check whether Falcon has GitHub access AND a target repo to scan. Two-step probe.
+
+**Step 8a — auth check:**
+
+```bash
+gh auth status
+```
+
+Success: exit 0; output names the authenticated user/host. Failure: any non-zero exit means GitHub is not connected (skip Probe 8 entirely; surface "GitHub VMware configs" as unavailable).
+
+**Step 8b — repo selection:**
+
+Required: `MIGRATION_MONITOR_VMWARE_REPO=<owner>/<repo>` is set (preferred), OR Falcon can prompt the user at Gate 1 to name the repo. Falcon does NOT scan all accessible orgs blindly — that's slow and surfaces irrelevant repos.
+
+If the env var is set, verify the repo exists and Falcon has read access:
+
+```bash
+gh repo view "$MIGRATION_MONITOR_VMWARE_REPO" --json name,owner,defaultBranchRef
+```
+
+Success: JSON returned with `name` matching the env var. Failure: `repo not found` or auth-denied error → surface as "GitHub auth OK but target repo unreachable" and ask the user to fix the env var or repo permissions.
+
+**Success pattern:** Both 8a and 8b succeed AND a repo is identified. Falcon now has a target to scan in Phase 2.
+
+**Failure interpretation:**
+- 8a fails → no GitHub at all; falls back to local cwd scanning.
+- 8a succeeds but no repo identified → ask user at Gate 1: "GitHub is connected; do you have a repo with VMware configs (RVTools exports, Terraform vSphere, VCF/Aria templates)? Type `<owner>/<repo>` or `none`."
+- 8a succeeds, repo identified, but read access fails → user fixes permissions and re-runs Phase 0.
+
+**Capability surfaced:** GitHub repo scan as a Phase 2 source — finds RVTools exports stored in the repo and/or raw IaC describing VMware workloads.
+
+---
+
 ### Available-Surfaces Assembly Logic
 
-After all seven probes complete, Falcon assembles the available-surfaces set using these rules.
+After all eight probes complete, Falcon assembles the available-surfaces set using these rules.
 
 **Required surfaces (Gate 1 blocks if either is missing):**
 
 1. AWS must be reachable (Probe 1 succeeded).
-2. At least one VMware source must be available: either live vCenter (Probe 2 succeeded) OR at least one RVTools file found (Probe 3 succeeded).
+2. At least one VMware source must be available, in priority order:
+   - Live vCenter (Probe 2 succeeded), OR
+   - GitHub repo with VMware configs (Probe 8 succeeded), OR
+   - RVTools file in cwd (Probe 3 succeeded).
+   At least one of these three must be available.
 
 If either required surface is missing, stop at Gate 1 and present the remediation steps for the failing probe. Do not proceed to Phase 1.
 
@@ -141,7 +180,8 @@ Surface Availability Checklist
 ═══════════════════════════════════════════════════════════════════
   [✓] AWS reachability       Account: 123456789012 (us-east-1)
   [✓] VMware source          Live vCenter 8.0.2 at vcenter.corp.example
-  [✗] RVTools export         Not found (live vCenter available — OK)
+  [✗] RVTools export (cwd)   Not found (live vCenter available — OK)
+  [✓] GitHub repo scan       acme/vmware-stack (read access verified)
   [✓] Metric sources         Datadog
   [✓] curl / endpoints       curl 8.6.0
   [✓] openssl / TLS          OpenSSL 3.3.0
@@ -441,6 +481,132 @@ python3 -c "import openpyxl; wb = openpyxl.load_workbook('RVTools.xlsx', data_on
 ```
 
 CSV files are read natively via Falcon's file-reading capabilities. After reading, assemble VMs into the canonical inventory shape (see Section 4d) using `vInfo` as the primary record and joining `vCPU`, `vMemory`, `vDisk`, `vNetwork` on the `VM` name column.
+
+---
+
+### GitHub Repo Scan
+
+Use when Probe 8 succeeded and a target repo was identified. The repo is the team's source of truth for VMware inventory snapshots and/or IaC describing VMware workloads. **GitHub takes priority over local cwd** when both are available — the repo is canonical.
+
+Falcon authenticates as the user (Probe 8a). All scans below are read-only `gh api` / `gh repo view` calls.
+
+**Step 1 — list repo contents at the default branch root:**
+
+```bash
+gh api "repos/$MIGRATION_MONITOR_VMWARE_REPO/git/trees/$(gh repo view "$MIGRATION_MONITOR_VMWARE_REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')?recursive=1" \
+  --jq '.tree[] | select(.type=="blob") | .path'
+```
+
+This produces a flat list of every file path in the repo. Filter the list locally (no extra API calls) for VMware-relevant patterns:
+
+| Pattern | Source type |
+|---------|-------------|
+| `RVTools*.xlsx` (case-insensitive) | RVTools export — preferred (richer than CSV) |
+| `RVTools*.csv` | RVTools export, CSV form |
+| `*.tf` AND content contains `provider "vsphere"` or `vsphere_virtual_machine` | Terraform vSphere IaC |
+| `*.yaml` / `*.yml` AND content contains `Cloud.vSphere.Machine` | VCF Automation template |
+| `*.yaml` / `*.yml` AND content contains `formatVersion: 1` AND `Cloud.Machine` | Aria Automation blueprint |
+| `*.ovf` | OVF descriptor (VM image) |
+| `*.ps1` AND content contains `Connect-VIServer` or `Get-VM` | PowerCLI inventory script (low-fidelity — flag for manual review) |
+
+**Step 2 — fetch matching files:**
+
+For RVTools exports (binary/large) — use `gh api` with raw accept header:
+
+```bash
+gh api "repos/$MIGRATION_MONITOR_VMWARE_REPO/contents/$FILE_PATH?ref=$BRANCH" \
+  -H "Accept: application/vnd.github.raw" \
+  > /tmp/mmon_rvtools_$(basename "$FILE_PATH")
+```
+
+For text configs (`.tf`, `.yaml`, etc.) — same form but the response is the file body directly. No need to write to disk if the file is small; pipe through the parser.
+
+**Step 3 — content-search confirmation:**
+
+When filename alone is ambiguous (e.g., a generic `*.yaml` could be Helm values, k8s manifests, or VCF Automation), use `gh api search/code` to narrow:
+
+```bash
+gh api "search/code?q=repo:$MIGRATION_MONITOR_VMWARE_REPO+Cloud.vSphere.Machine+language:yaml" \
+  --jq '.items[].path'
+```
+
+GitHub code search is rate-limited; cap at 30 queries per session. Cache results in conversation memory.
+
+**Step 4 — assemble inventory:**
+
+For each matched RVTools file, parse using the rules in **VMware RVTools Fallback** above. For raw IaC files, parse using the rules in **Raw IaC Parsers** below. Merge results into a single canonical inventory (see Section 4d). When the same VM appears in multiple sources (e.g., declared in Terraform AND present in an RVTools export), prefer the RVTools record (closer to live state) and annotate the VM with `inventory_sources: ["rvtools", "terraform-vsphere"]` for traceability.
+
+**Sensitive-content guard.** Never include the contents of `.tfvars`, `.env`, `*.secret*`, or files matching `id_rsa*` / `*.pem` / `*.key` in any output, divergence report, or remediation hint. If such a file is encountered during scan, skip it and log a one-line note ("skipped sensitive file: <path>"). The skill's content surface is inventory metadata; secrets must never round-trip through a report.
+
+---
+
+### Raw IaC Parsers
+
+Use when no RVTools export exists anywhere (cwd or GitHub) but raw VMware IaC was found. Lower fidelity than RVTools (declared intent, not live state) but better than nothing.
+
+**Terraform vSphere provider** (`*.tf`):
+
+Look for `vsphere_virtual_machine` resource blocks. Extract per-VM:
+
+| Terraform attribute | Inventory field |
+|---------------------|-----------------|
+| `name` | `name` |
+| `num_cpus` | `vcpus` |
+| `memory` | `memoryMB` |
+| `guest_id` | `guestOs` (e.g., `ubuntu64Guest`) |
+| `disk[*].size` | `disks[*].sizeGB` |
+| `disk[*].thin_provisioned` | `disks[*].thin` |
+| `disk[*].datastore_id` (data source ref) | `disks[*].datastore` (resolved name) |
+| `network_interface[*]` referencing a `vsphere_distributed_port_group` | `networks[*].portGroup` |
+| `clone.template_uuid` | informational — record as `template_source` annotation |
+| `tags` block (referencing `vsphere_tag`) | `tags[]` |
+| (host placement is DRS-determined, no explicit Terraform field) | `host` left empty |
+
+Falcon parses HCL via `hcl2json` if available, else regex extraction is acceptable for v1 scope:
+
+```bash
+# If hcl2json is available
+hcl2json < main.tf | jq '.resource.vsphere_virtual_machine[]'
+```
+
+```bash
+# Fallback regex (less robust, sufficient for typical Terraform style)
+awk '/^resource "vsphere_virtual_machine"/,/^}/' main.tf
+```
+
+**Important:** Terraform-derived inventory has no IP addresses unless static IPs are pinned in `clone.customize.network_interface[*].ipv4_address`. Mark VMs without resolved IPs in the inventory as `ipAddresses: []` — Phase 1 mapping signal for IP-match (+30) is unavailable for these workloads, which lowers their pairing confidence.
+
+**VCF Automation YAML** (`Cloud.vSphere.Machine` resources):
+
+Extract per resource:
+
+| VCF YAML field | Inventory field |
+|----------------|-----------------|
+| `properties.flavor` | indirect — resolves to vCPU/memory via the project's flavor-mapping table (the user must provide if not in repo) |
+| `properties.image` | informational — record as `template_source` |
+| `properties.networks[*].network` | `networks[*].portGroup` |
+| `properties.constraints[*]` (with `tag`) | `tags[]` |
+
+VCF blueprints are intent-only — no IP, no host, no disk capacity unless explicitly declared.
+
+**Aria Automation blueprint** (`Cloud.Machine` with formatVersion 1):
+
+Same shape as VCF Automation but resource type is `Cloud.Machine` (cloud-agnostic) rather than `Cloud.vSphere.Machine`. Treat identically; the resulting inventory is platform-agnostic so we can't always attribute the VMware target without additional metadata. Annotate as `inventory_source: "aria-blueprint"` so Phase 3 tolerance rules know to apply intent-rather-than-state semantics.
+
+**OVF descriptors** (`*.ovf`):
+
+XML format. Extract the `<VirtualSystem>` element. Useful fields:
+
+| OVF element | Inventory field |
+|-------------|-----------------|
+| `<Name>` (or `<VirtualSystem ovf:id="...">`) | `name` |
+| `<vssd:VirtualSystemType>` | `guestOs` (e.g., `vmx-19`) |
+| `<rasd:VirtualQuantity>` (within CPU and Memory items) | `vcpus`, `memoryMB` |
+| `<File ovf:href="...">` (disk image) | `disks[].sizeGB` (resolved from `<Disk ovf:capacity>`) |
+
+OVF describes a VM template/image, not a deployment instance. Phase 1 mapping has no IP / hostname / runtime context; the OVF source is best for confirming "this VM existed at template time" rather than for behavior parity.
+
+**PowerCLI scripts:** flag for manual review only. v1 does not parse PowerCLI to extract inventory — the imperative style and runtime evaluation make static parsing fragile. Falcon may suggest the user re-run the script and capture its output as a structured CSV, then run Phase 0 again.
 
 ---
 

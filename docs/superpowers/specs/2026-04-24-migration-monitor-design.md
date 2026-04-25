@@ -50,6 +50,7 @@ The `migration-monitor` skill provides post-cutover parity assurance for VMware 
 | 10 | Flat `references/` layout | Consistent with sibling skills; 6 references in v1. |
 | 11 | No shipped scripts / schemas-as-files | Falcon discovers natively; schemas live as inline examples in references. Avoids duplicating what Falcon already does. |
 | 12 | Mapping score is uncapped additive | Signals sum to an unbounded score. Thresholds (≥80 / 40–79 / <40) operate on raw sum; higher scores indicate stronger match even above 100. |
+| 13 | GitHub repo scan as a Phase 2 source, ranked second after live vCenter | Real teams keep RVTools snapshots and IaC in the same repo as their migration plan. When `gh auth status` succeeds AND `MIGRATION_MONITOR_VMWARE_REPO` is set (or user names the repo at Gate 1), Falcon scans the repo for RVTools exports + raw IaC (Terraform vSphere, VCF/Aria, OVF) before falling back to local cwd. The repo is the team's source of truth. Sensitive files (`.tfvars`, `.env`, `*.pem`, `*.key`, `id_rsa*`, `*.secret*`) are skipped — must never round-trip into reports. |
 
 ## Architecture
 
@@ -129,6 +130,7 @@ Runs first every session. Falcon executes the probes (it has the CLI tools and e
 | AWS reachable | `aws sts get-caller-identity` | account ID, active region |
 | vCenter reachable | `govc about` (only if `GOVC_URL` + `GOVC_USERNAME` set) | live VMware discovery |
 | Static VMware exports | scan cwd for `RVTools*.xlsx` / `RVTools*.csv` | fallback if no live vCenter |
+| GitHub VMware configs | `gh auth status` succeeds AND (`MIGRATION_MONITOR_VMWARE_REPO=<owner>/<repo>` set OR user names the repo at Gate 1) | scan repo for RVTools exports + raw IaC (Terraform vSphere, VCF/Aria, OVF) |
 | Metric sources | env-var scan: `PROMETHEUS_URL`, `DATADOG_API_KEY` + `DATADOG_APP_KEY`, `NEW_RELIC_API_KEY` + `NEW_RELIC_ACCOUNT`, `VROPS_URL` + `VROPS_USERNAME` | which metric sources are queryable |
 | Endpoint probing | `curl --version` | HTTP/TCP diffing available |
 | TLS probing | `openssl version` | TLS cert checks available |
@@ -136,7 +138,7 @@ Runs first every session. Falcon executes the probes (it has the CLI tools and e
 
 The skill enumerates **available surfaces** (not a fixed "mode" enum) from probe outcomes:
 
-- **Required:** AWS + (live vCenter OR RVTools export). Without both sides, stop and ask user to remediate env.
+- **Required:** AWS + (live vCenter OR GitHub repo with VMware configs OR RVTools export in cwd OR raw VMware IaC in cwd). At least one VMware-side source must produce an inventory; the four are tried in priority order (live > GitHub > local-cwd-export > local-cwd-IaC).
 - **Optional surfaces** (skipped if unavailable, logged with reason):
   - Endpoint parity (requires `curl`)
   - TLS checks (requires `openssl`)
@@ -179,10 +181,14 @@ Skill prints the surface checklist at **Gate 1**. User confirms or adjusts env a
 
 Falcon enumerates state on both sides using its native discovery. Discovery is comprehensive (full account / region for AWS, full vCenter for VMware), not filtered — because we don't trust any single signal (including tags) to scope correctly.
 
-**VMware side discovery** (Falcon runs these or reads RVTools export):
-- VM inventory: name, MoRef, guest OS, guest hostname (via VMware Tools), primary + secondary IPs (all NICs), MAC addresses, vCPUs, memoryMB, disk capacities, annotations/notes, tags.
-- Host + cluster + datastore + network context — used by Phase 3 tolerance rules.
-- RVTools fallback: `vInfo` / `vCPU` / `vMemory` / `vDisk` / `vNetwork` / `vHost` / `vDatastore` tabs merged into the same normalized view.
+**VMware side discovery — source priority** (try in order; stop at first that yields an inventory):
+
+1. **Live vCenter** via `govc *.info` — highest fidelity, current state. VM inventory: name, MoRef, guest OS, guest hostname (via VMware Tools), primary + secondary IPs (all NICs), MAC addresses, vCPUs, memoryMB, disk capacities, annotations/notes, tags. Host + cluster + datastore + network context.
+2. **GitHub repo scan** — when `gh auth status` ok and `MIGRATION_MONITOR_VMWARE_REPO` is set (or user names a repo at Gate 1). Falcon uses `gh api` to fetch `RVTools_*.xlsx` / `RVTools_*.csv` from the repo; treats the repo as the team's source of truth. Falls through to raw-IaC scan in the same repo if no exports found.
+3. **RVTools export in cwd** — `vInfo` / `vCPU` / `vMemory` / `vDisk` / `vNetwork` / `vHost` / `vDatastore` tabs merged into the same normalized view.
+4. **Raw VMware IaC** (cwd or GitHub) — Terraform `vsphere_virtual_machine` resources, VCF Automation `Cloud.vSphere.Machine` YAML, Aria Automation blueprints, OVF descriptors. Lower fidelity (declared intent, not live state) — Phase 1 mapping confidence is reduced for these sources because IPs and runtime context are typically absent. Raw-IaC parsers are documented in `references/probe-and-map.md`.
+
+**Sensitive-content guard.** When scanning a GitHub repo, Falcon must skip `.tfvars`, `.env`, `*.secret*`, `*.pem`, `*.key`, and `id_rsa*` files entirely. These typically contain credentials and must not round-trip into divergence reports or remediation hints.
 
 **AWS side discovery** (Falcon runs these):
 - EC2 instances (`aws ec2 describe-instances`) — Name tag, ENI private/public IPs, tags, instance type, platform (Windows/Linux).
