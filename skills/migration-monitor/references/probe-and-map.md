@@ -758,6 +758,36 @@ Extract: `Name`, `Type`, `TTL`, `ResourceRecords[].Value`, `AliasTarget.DNSName`
 
 **Pagination note:** All list/describe commands return paginated results. The `--no-cli-pager` flag prevents interactive blocking. For very large accounts (>500 instances), consider adding `--max-items 1000` and iterating with `--starting-token`; Falcon handles this natively via its CLI output parsing.
 
+**Additional AWS calls for Phase 7 cost analysis:**
+
+These calls extend the baseline above. Phase 7 cost analysis (`references/cost-analysis.md`) needs them; Phase 3 parity does not. Run them after the parity-relevant calls:
+
+```bash
+# EKS clusters and versions (for extended-support fee detection)
+aws eks list-clusters --region "$AWS_REGION" --no-cli-pager
+# Then per cluster:
+aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --no-cli-pager
+aws eks list-nodegroups --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" --no-cli-pager
+aws eks describe-nodegroup --cluster-name "$CLUSTER_NAME" --nodegroup-name "$NG" --region "$AWS_REGION"
+
+# EBS snapshots owned by this account (for orphan / aged-snapshot flag)
+aws ec2 describe-snapshots --owner-ids self --region "$AWS_REGION" --no-cli-pager
+
+# CloudWatch log groups + retention (for no-retention flag)
+aws logs describe-log-groups --region "$AWS_REGION" --no-cli-pager
+
+# NAT Gateways (already needed for parity routing checks; reused for cost throughput query)
+aws ec2 describe-nat-gateways --region "$AWS_REGION" --no-cli-pager
+
+# NAT throughput sample (per NAT, last 30 days, for cost.nat-gateway.high-throughput flag)
+aws cloudwatch get-metric-statistics --namespace AWS/NATGateway \
+  --metric-name BytesOutToDestination --dimensions Name=NatGatewayId,Value="$NAT_ID" \
+  --start-time "$(date -u +%FT%TZ -d '30 days ago' 2>/dev/null || date -u -v-30d +%FT%TZ)" \
+  --end-time "$(date -u +%FT%TZ)" --period 86400 --statistics Sum --region "$AWS_REGION"
+```
+
+Date arithmetic uses the same portable form as `references/metrics-parity.md` to handle macOS vs GNU `date`. All calls are read-only. Falcon may skip the per-NAT throughput call if no NAT Gateway exists in the account.
+
 ---
 
 ### Canonical Inventory JSON Shape

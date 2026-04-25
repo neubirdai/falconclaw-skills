@@ -99,9 +99,16 @@ Load `references/data-parity.md`. Run the engine-specific read-only SQL queries 
 
 **Only `SELECT` queries are permitted.** No DDL, no `SELECT INTO`, no `UPDATE`/`DELETE`/`INSERT`.
 
-## Phase 7: Divergence Report
+## Phase 7: Divergence Report + Cost Analysis
 
-Load `references/divergence-report.md`. Consolidate outputs of Phases 3–6 into a single classified report: structured JSON (format defined inline in that reference) + human summary table. Present at **Gate 3**. User dispositions each divergence (accepted / investigate / blocker).
+Load `references/divergence-report.md` for the report format and `references/cost-analysis.md` for the cost-flag rules. This phase has two deliverables emitted in one report:
+
+1. **Divergences** — consolidated outputs from Phases 3–6 (parity findings).
+2. **Cost flags** — high-impact AWS cost patterns observed on the deployed counterparts (e.g. EKS extended-support fees, EC2 previous-generation instance types, unattached EIPs, EBS gp2-vs-gp3, CloudWatch Logs without retention). Surfaces concerns the team is paying for but may not realize.
+
+The report combines both as structured JSON + a human summary table. Present at **Gate 3**. User dispositions divergences AND cost flags (accepted / investigate / remediate-later); cost flags are not blockers — they're heads-ups.
+
+Cost analysis runs additional read-only AWS API calls beyond the Phase 2 baseline (EKS clusters, EBS snapshots, CW log groups, NAT throughput metrics) — listed in `references/cost-analysis.md`. Falcon MUST web-search current AWS pricing for the user's region before emitting any specific dollar figure; cost estimates in the reference file are typical retail upper bounds.
 
 ## Reference Guide
 
@@ -112,7 +119,8 @@ Load `references/divergence-report.md`. Consolidate outputs of Phases 3–6 into
 | Endpoint curl/nc/openssl recipes | `references/endpoint-parity.md` | Phase 4 |
 | Metric source detection + name mapping | `references/metrics-parity.md` | Phase 5 |
 | SQL queries per engine + comparison rules | `references/data-parity.md` | Phase 6 |
-| Report schema + severity rubric + remediation | `references/divergence-report.md` | Phase 7 |
+| Cost-flag rules + AWS pricing references | `references/cost-analysis.md` | Phase 7 (cost portion) |
+| Report schema + severity rubric + remediation | `references/divergence-report.md` | Phase 7 (assembly) |
 
 ## Output Conventions
 
@@ -157,6 +165,7 @@ Load `references/divergence-report.md`. Consolidate outputs of Phases 3–6 into
 - **Emit precise CLI commands for every probe, discovery, and comparison step.** No narrative handwaving. The references specify exact invocations; follow them.
 - **Web-search current AWS CloudWatch metric namespaces** before finalizing any metric mapping — namespaces and metric names evolve.
 - **Confirm the metric comparison window with the user before Phase 5 runs.** Default is 7 days pre-cutover vs 7 days post-cutover; user may override.
+- **Web-search current AWS pricing in the user's region before emitting any specific cost figure.** Pricing changes; reserved instances / savings plans / EDP discounts distort retail rates. The estimates in `cost-analysis.md` are typical retail upper bounds. Always include the disclaimer documented in `cost-analysis.md` when emitting cost flags.
 - Classify every divergence by severity using the tolerance rules in the relevant parity reference.
 - Skip unavailable phases explicitly — the divergence report must include a `skippedPhases` list with reasons. Never silently skip.
 

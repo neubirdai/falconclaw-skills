@@ -25,7 +25,14 @@ Phase 7 emits the following JSON structure. Field descriptions follow the exampl
     "minor": 12,
     "skippedPhases": ["data"],
     "totalPairs": 14,
-    "pairsWithCriticalDivergence": 1
+    "pairsWithCriticalDivergence": 1,
+    "costFlags": {
+      "critical": 1,
+      "major": 3,
+      "minor": 2,
+      "informational": 1,
+      "estimatedMonthlySavingsUSD": 4825
+    }
   },
   "skipReasons": {
     "data": "SOURCE_DB_URI and TARGET_DB_URI not set in env"
@@ -75,7 +82,30 @@ Phase 7 emits the following JSON structure. Field descriptions follow the exampl
       }
     ],
     "data": []
-  }
+  },
+  "cost_flags": [
+    {
+      "id": "cost-001",
+      "type": "cost.eks.extended-support-active",
+      "severity": "critical",
+      "resource": {"type": "eks_cluster", "id": "retail-store-prod", "region": "us-east-1"},
+      "description": "EKS cluster `retail-store-prod` is on version 1.28, which entered extended support on 2024-03-23. Extended support fee adds $0.10/vCPU/hour.",
+      "estimated_monthly_cost": "$4320",
+      "evidence": {"version": "1.28", "vcpus_in_cluster": 60, "extended_support_start": "2024-03-23", "rate_per_vcpu_hr": 0.10, "monthly_hours": 720},
+      "remediationHint": "Upgrade to a supported version: aws eks update-cluster-version --name retail-store-prod --version 1.31. Plan blue/green rollout for stateful workloads. Web-search 'AWS EKS Kubernetes version standard support' for the current support timeline."
+    },
+    {
+      "id": "cost-002",
+      "type": "cost.eip.unattached",
+      "severity": "major",
+      "resource": {"type": "elastic_ip", "id": "eipalloc-0abc123", "region": "us-east-1"},
+      "description": "Elastic IP 52.0.0.10 is allocated but not attached to any resource — billed at $0.005/hour ($3.60/month).",
+      "estimated_monthly_cost": "$4",
+      "evidence": {"public_ip": "52.0.0.10", "allocation_id": "eipalloc-0abc123", "associated": false},
+      "remediationHint": "If unused, release: aws ec2 release-address --allocation-id eipalloc-0abc123. If reserved for future use, attach to a running resource to halt the charge."
+    }
+  ],
+  "costEstimateDisclaimer": "Cost estimates use typical 2026 retail rates and reflect approximate magnitude only. Reserved Instances, Savings Plans, EDP discounts, Spot pricing, and regional rate differences will all alter actual figures. Validate against AWS Cost Explorer before acting on any specific number."
 }
 ```
 
@@ -98,6 +128,19 @@ Phase 7 emits the following JSON structure. Field descriptions follow the exampl
 - `phases.infra` / `phases.endpoint` / `phases.metrics` / `phases.data` — arrays of divergence
   objects per phase. An empty array (`[]`) means the phase ran and found no divergences. A missing
   key means the phase was skipped (reconstruct from `summary.skippedPhases`).
+- `cost_flags` — array of cost-pattern observations (see `references/cost-analysis.md` for the
+  catalog of flag types and severity calibration). Each entry has `id`, `type`, `severity`,
+  `resource` (target-side AWS resource), `description`, `estimated_monthly_cost` (string, USD,
+  always approximate), `evidence`, and `remediationHint`. Cost flags are NEVER blockers — they are
+  surfaced for user awareness and dispositioned at Gate 3 like divergences. An empty array means
+  cost analysis ran and found no flags. A missing `cost_flags` key means cost analysis was skipped
+  (e.g., user opted out at session start or AWS access was insufficient).
+- `summary.costFlags` — counts of cost flags by severity plus an optional rollup
+  `estimatedMonthlySavingsUSD` (integer USD). The savings number is the sum of per-flag estimates
+  and inherits all the disclaimers — treat as approximate magnitude, not commitment.
+- `costEstimateDisclaimer` — present whenever `cost_flags` is non-empty. A user-facing disclaimer
+  explaining that cost figures use retail rates and are approximate; actual billing depends on
+  Reserved Instances, Savings Plans, EDP discounts, Spot pricing, and regional rate differences.
 
 Each divergence object inside a phase array carries these required fields:
 
@@ -264,9 +307,10 @@ Falcon prints for the operator to review before disposition.
 ```text
 Migration Monitor Report — generated 2026-04-24T15:00:00Z
 Workloads paired: 14 | skipped phases: [data]
-Summary: 2 critical, 5 major, 12 minor
+Divergences: 2 critical, 5 major, 12 minor
+Cost flags:  1 critical, 3 major, 2 minor, 1 info  | est. ~$4,825/month preventable
 
-── CRITICAL ──
+── DIVERGENCES — CRITICAL ──
 [infra-003] vm-1001 → i-0abc: encryption-missing
             Target EBS volumes unencrypted; source had VMware disk encryption.
             Remediation: re-provision with encrypted snapshot (plan downtime).
@@ -276,7 +320,7 @@ Summary: 2 critical, 5 major, 12 minor
             Remediation: check ALB target health + app-side 5xx root cause in
             CloudWatch Logs.
 
-── MAJOR ──
+── DIVERGENCES — MAJOR ──
 [infra-001] vm-1001 → i-0abc: vcpu-deficit (2 vCPU vs 4, ratio 0.5)
             Remediation: aws ec2 modify-instance-attribute ...
 
@@ -284,6 +328,31 @@ Summary: 2 critical, 5 major, 12 minor
             Remediation: scale up or enable auto-scaling.
 
 ... (12 minor divergences collapsed — expand for details)
+
+── COST FLAGS — CRITICAL ──
+[cost-001] eks_cluster retail-store-prod: extended-support-active   (~$4,320/mo)
+            EKS cluster on v1.28; entered extended support 2024-03-23.
+            Remediation: aws eks update-cluster-version --version 1.31.
+
+── COST FLAGS — MAJOR ──
+[cost-002] elastic_ip eipalloc-0abc123: unattached                  (~$4/mo)
+            EIP 52.0.0.10 allocated but not attached.
+            Remediation: aws ec2 release-address --allocation-id ...
+
+[cost-003] ec2_instance i-0abc: previous-generation                 (~$10/mo)
+            m5.large on previous-gen family. m7i.large is ~11% cheaper.
+            Remediation: aws ec2 modify-instance-attribute ...
+
+[cost-004] log_group /aws/lambda/orders: no-retention               (~variable, grows)
+            CloudWatch log group has no retention policy.
+            Remediation: aws logs put-retention-policy --retention-in-days 30.
+
+── COST FLAGS — MINOR + INFO ──
+... (3 cost flags collapsed — expand for details)
+
+Note: cost figures use typical 2026 retail rates and reflect approximate
+magnitude only. Reserved Instances / Savings Plans / EDP discounts /
+regional differences will alter actuals. Validate with AWS Cost Explorer.
 ```
 
 ### Format rules
